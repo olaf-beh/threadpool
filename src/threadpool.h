@@ -37,7 +37,7 @@ extern "C" {
  * @file threadpool.h
  * @brief Threadpool Header File
  */
- 
+
  /**
  * Increase this constants at your own risk
  * Large values might slow down your system
@@ -93,6 +93,33 @@ int threadpool_add(threadpool_t *pool, void (*routine)(void *),
  * processes all pending tasks before shutdown.
  */
 int threadpool_destroy(threadpool_t *pool, int flags);
+
+/**
+ * @function threadpool_resize
+ * @brief Modify the number of worker threads.
+ *
+ * Increasing or decreasing the number of worker threads might be of interest
+ * in cases where you want to dynamically adapt resource usage.
+ *
+ * @param pool         Thread pool.
+ * @param thread_count Number of worker threads.
+ * @return 0 on success or -1 on error.
+ */
+int threadpool_resize(threadpool_t *pool, int thread_count);
+
+/**
+ * @function threadpool_get_threat_count
+ * @Brief Get the current number of worker threads.
+ *
+ * After modifying the number of worker threads by calling threadpool_resize()
+ * the number of worker threads differs from the initial value given in
+ * threadpool_create().
+ *
+ * @param pool Thread pool.
+ * @return Current number of worker threads.
+ */
+int threadpool_get_threat_count(threadpool_t *pool);
+
 
 #ifdef __cplusplus
 }

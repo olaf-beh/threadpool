@@ -9,6 +9,7 @@ Currently, the implementation:
  * Starts all threads on creation of the thread pool.
  * Reserves one task for signaling the queue is full.
  * Stops and joins all worker threads on destroy.
+ * Number of worker threads can be dynamically resized.
 
 Possible enhancements
 =====================

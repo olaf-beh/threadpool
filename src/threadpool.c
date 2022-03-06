@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
 
 #include "threadpool.h"
 
@@ -56,12 +57,24 @@ typedef struct {
 } threadpool_task_t;
 
 /**
+ * @struct thread_info_t
+ * @brief Manages thread specific information.
+ * @var id pthread id.
+ * @var terminated 1 (true) if thread ist terminated.
+ */
+typedef struct {
+    pthread_t id;
+    char terminated;
+} thread_info_t;
+
+/**
  *  @struct threadpool
  *  @brief The threadpool struct
  *
  *  @var notify       Condition variable to notify worker threads.
- *  @var threads      Array containing worker threads ID.
- *  @var thread_count Number of threads
+ *  @var tinfo        Array of thread_info_t elements.
+ *  @var tinfo_size   Size of tinfo array.
+ *  @var thread_count Requested number of threads.
  *  @var queue        Array containing the task queue.
  *  @var queue_size   Size of the task queue.
  *  @var head         Index of the first element.
@@ -73,9 +86,11 @@ typedef struct {
 struct threadpool_t {
   pthread_mutex_t lock;
   pthread_cond_t notify;
-  pthread_t *threads;
+  thread_info_t *tinfo;
+  int tinfo_size;
   threadpool_task_t *queue;
   int thread_count;
+  int thread_count_limit;
   int queue_size;
   int head;
   int tail;
@@ -103,38 +118,34 @@ threadpool_t *threadpool_create(int thread_count, int queue_size, int flags)
         return NULL;
     }
 
-    if((pool = (threadpool_t *)malloc(sizeof(threadpool_t))) == NULL) {
+    if((pool = (threadpool_t *)calloc(1, sizeof(threadpool_t))) == NULL) {
         goto err;
     }
 
     /* Initialize */
-    pool->thread_count = 0;
     pool->queue_size = queue_size;
-    pool->head = pool->tail = pool->count = 0;
-    pool->shutdown = pool->started = 0;
+    pool->tinfo_size = pool->thread_count = thread_count;
 
-    /* Allocate thread and task queue */
-    pool->threads = (pthread_t *)malloc(sizeof(pthread_t) * thread_count);
+    /* Allocate thread info and task queue */
+    pool->tinfo = (thread_info_t *)calloc(pool->tinfo_size, sizeof(thread_info_t));
     pool->queue = (threadpool_task_t *)malloc
         (sizeof(threadpool_task_t) * queue_size);
 
     /* Initialize mutex and conditional variable first */
     if((pthread_mutex_init(&(pool->lock), NULL) != 0) ||
        (pthread_cond_init(&(pool->notify), NULL) != 0) ||
-       (pool->threads == NULL) ||
+       (pool->tinfo == NULL) ||
        (pool->queue == NULL)) {
         goto err;
     }
 
     /* Start worker threads */
-    for(i = 0; i < thread_count; i++) {
-        if(pthread_create(&(pool->threads[i]), NULL,
+    for(i = 0; i < pool->tinfo_size; i++) {
+        if(pthread_create(&(pool->tinfo[i].id), NULL,
                           threadpool_thread, (void*)pool) != 0) {
             threadpool_destroy(pool, 0);
             return NULL;
         }
-        pool->thread_count++;
-        pool->started++;
     }
 
     return pool;
@@ -225,9 +236,9 @@ int threadpool_destroy(threadpool_t *pool, int flags)
             break;
         }
 
-        /* Join all worker thread */
-        for(i = 0; i < pool->thread_count; i++) {
-            if(pthread_join(pool->threads[i], NULL) != 0) {
+        /* Join all worker threads */
+        for(i = 0; i < pool->tinfo_size; i++) {
+            if(pthread_join(pool->tinfo[i].id, NULL) != 0) {
                 err = threadpool_thread_failure;
             }
         }
@@ -247,18 +258,18 @@ int threadpool_free(threadpool_t *pool)
     }
 
     /* Did we manage to allocate ? */
-    if(pool->threads) {
-        free(pool->threads);
+    if(pool->tinfo) {
+        free(pool->tinfo);
         free(pool->queue);
- 
-        /* Because we allocate pool->threads after initializing the
+
+        /* Because we allocate pool->tinfo after initializing the
            mutex and condition variable, we're sure they're
            initialized. Let's lock the mutex just in case. */
         pthread_mutex_lock(&(pool->lock));
         pthread_mutex_destroy(&(pool->lock));
         pthread_cond_destroy(&(pool->notify));
     }
-    free(pool);    
+    free(pool);
     return 0;
 }
 
@@ -267,6 +278,18 @@ static void *threadpool_thread(void *threadpool)
 {
     threadpool_t *pool = (threadpool_t *)threadpool;
     threadpool_task_t task;
+
+    int i;
+
+    pthread_mutex_lock(&(pool->lock));
+    /* get tinfo array index */
+    for (i = 0; i < pool->tinfo_size; ++i) {
+        if (pool->tinfo[i].id == pthread_self())
+            break;
+    }
+    pool->tinfo[i].terminated = 0;
+    pool->started++;
+    pthread_mutex_unlock(&(pool->lock));
 
     for(;;) {
         /* Lock must be taken to wait on conditional variable */
@@ -280,7 +303,8 @@ static void *threadpool_thread(void *threadpool)
 
         if((pool->shutdown == immediate_shutdown) ||
            ((pool->shutdown == graceful_shutdown) &&
-            (pool->count == 0))) {
+            (pool->count == 0)) ||
+           (pool->started > pool->thread_count)) {
             break;
         }
 
@@ -298,8 +322,73 @@ static void *threadpool_thread(void *threadpool)
     }
 
     pool->started--;
+    pool->tinfo[i].terminated = 1;
 
     pthread_mutex_unlock(&(pool->lock));
     pthread_exit(NULL);
-    return(NULL);
+    //return(NULL);
+}
+
+int threadpool_resize(threadpool_t *pool, int resize)
+{
+    int i;
+
+    /* no more than MAX_THREADS */
+    resize = resize > MAX_THREADS ? MAX_THREADS : resize;
+    /* not less than 1 */
+    resize = resize <= 0 ? 1 : resize;
+
+    pthread_mutex_lock(&(pool->lock));
+    pool->thread_count = resize;
+    pthread_mutex_unlock(&(pool->lock));
+
+    if (resize > pool->tinfo_size) {
+        /* Reallocate worker tinfo array */
+
+        int size_prev = pool->tinfo_size;
+
+        pthread_mutex_lock(&(pool->lock));
+        pool->tinfo_size = resize;
+        pool->tinfo = (thread_info_t *)realloc(pool->tinfo, sizeof(thread_info_t) * pool->tinfo_size);
+        pthread_mutex_unlock(&(pool->lock));
+
+        /* Initialize new array elements */
+        memset(pool->tinfo + size_prev, 0, sizeof(thread_info_t) * (pool->tinfo_size - size_prev));
+
+        /* Start additional worker threads for new tinfo array elements */
+        for(i = size_prev; i < pool->tinfo_size; i++) {
+            if(pthread_create(&(pool->tinfo[i].id), NULL,
+                        threadpool_thread, (void*)pool) != 0) {
+                return threadpool_thread_failure;
+            }
+        }
+    }
+
+    /* Restart worker threads if needed */
+    pthread_mutex_lock(&(pool->lock));
+    int started = pool->started;
+    pthread_mutex_unlock(&(pool->lock));
+    for(i = 0; i < pool->tinfo_size && started < resize; i++) {
+
+        pthread_mutex_lock(&(pool->lock));
+        int terminated = pool->tinfo[i].terminated;
+        pthread_mutex_unlock(&(pool->lock));
+
+        if (terminated) {
+            if(pthread_join(pool->tinfo[i].id, NULL) != 0) {
+                return threadpool_thread_failure;
+            }
+            if(pthread_create(&(pool->tinfo[i].id), NULL,
+                        threadpool_thread, (void*)pool) != 0) {
+                return threadpool_thread_failure;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int threadpool_get_threat_count(threadpool_t *pool)
+{
+    return pool->thread_count;
 }
